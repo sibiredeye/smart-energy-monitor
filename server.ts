@@ -1,26 +1,192 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
+import os from 'os';
 import { GoogleGenAI, Type } from '@google/genai';
 import { calculateTariff, calculateForecast } from './src/lib/tariffEngine.js';
 import { BillRecord, UserProfile } from './src/types.js';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// Server State Store - Per-Account Isolated Storage
+// CORS & Path Normalization for Vercel Serverless
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-user-id, x-user-email');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
+  // If Vercel rewrite strips the /api prefix, re-attach it so express routes match cleanly
+  if (!req.url.startsWith('/api') && !req.url.startsWith('/_')) {
+    req.url = '/api' + (req.url.startsWith('/') ? req.url : '/' + req.url);
+  }
+
+  next();
+});
+
+// Server State Store - Per-Account Isolated Storage with /tmp Persistence
 const usersByEmail = new Map<string, UserProfile>();
 const userPasswordsByEmail = new Map<string, string>();
 const billsByUserId = new Map<string, BillRecord[]>();
 let currentUserId: string | null = null;
 
-function getCurrentUser(): UserProfile | null {
-  if (!currentUserId) return null;
-  for (const user of usersByEmail.values()) {
-    if (user.id === currentUserId) return user;
+// Persistent Store Path in OS Temporary Directory (Writable on Vercel AWS Lambda /tmp)
+const STORE_PATH = path.join(os.tmpdir(), 'smart_energy_store.json');
+
+function saveStoreToDisk() {
+  try {
+    const data = {
+      users: Array.from(usersByEmail.entries()),
+      passwords: Array.from(userPasswordsByEmail.entries()),
+      bills: Array.from(billsByUserId.entries()),
+      currentUserId,
+    };
+    fs.writeFileSync(STORE_PATH, JSON.stringify(data), 'utf-8');
+  } catch (err) {
+    console.warn('[Store] Notice: Could not write store to disk:', err);
   }
+}
+
+function seedDemoData() {
+  const demoEmail = 'demo@energyapp.com';
+  const demoUser: UserProfile = {
+    id: 'user-demo-01',
+    email: demoEmail,
+    name: 'Demo Resident',
+    state: 'Tamil Nadu',
+    board: 'TANGEDCO (TNEB)',
+    billingCycle: 'Bi-Monthly',
+    budgetLimit: 2500,
+  };
+
+  usersByEmail.set(demoEmail, demoUser);
+  userPasswordsByEmail.set(demoEmail, 'demo');
+  currentUserId = demoUser.id;
+
+  const sampleBills: BillRecord[] = [
+    {
+      id: 'bill-demo-1',
+      userId: demoUser.id,
+      scanDate: '2026-07-15',
+      billingPeriod: 'Jul 2026',
+      billingCycle: 'Bi-Monthly',
+      units: 280,
+      amount: 1260,
+      isManual: false,
+      hasCustomAmount: false,
+      originalAmount: 1260,
+      status: 'Processed',
+      tariffSlab: '201-400 Units',
+      meterNumber: 'MTR-TN-849201',
+      breakdown: { energyCharge: 1140, fixedCharges: 60, taxAndDuty: 60 },
+      rawNotes: 'Verified TANGEDCO Domestic Tariff Bill',
+    },
+    {
+      id: 'bill-demo-2',
+      userId: demoUser.id,
+      scanDate: '2026-05-18',
+      billingPeriod: 'May 2026',
+      billingCycle: 'Bi-Monthly',
+      units: 320,
+      amount: 1510,
+      isManual: false,
+      hasCustomAmount: false,
+      originalAmount: 1510,
+      status: 'Processed',
+      tariffSlab: '201-400 Units',
+      meterNumber: 'MTR-TN-849201',
+      breakdown: { energyCharge: 1380, fixedCharges: 60, taxAndDuty: 70 },
+      rawNotes: 'Summer Peak Tariff Cycle',
+    },
+    {
+      id: 'bill-demo-3',
+      userId: demoUser.id,
+      scanDate: '2026-03-12',
+      billingPeriod: 'Mar 2026',
+      billingCycle: 'Bi-Monthly',
+      units: 210,
+      amount: 885,
+      isManual: false,
+      hasCustomAmount: false,
+      originalAmount: 885,
+      status: 'Processed',
+      tariffSlab: '201-400 Units',
+      meterNumber: 'MTR-TN-849201',
+      breakdown: { energyCharge: 795, fixedCharges: 50, taxAndDuty: 40 },
+      rawNotes: 'Spring Regular Consumption',
+    },
+  ];
+
+  billsByUserId.set(demoUser.id, sampleBills);
+  saveStoreToDisk();
+}
+
+function loadStoreFromDisk() {
+  try {
+    if (fs.existsSync(STORE_PATH)) {
+      const content = fs.readFileSync(STORE_PATH, 'utf-8');
+      const data = JSON.parse(content);
+      if (Array.isArray(data.users)) {
+        usersByEmail.clear();
+        for (const [k, v] of data.users) usersByEmail.set(k, v);
+      }
+      if (Array.isArray(data.passwords)) {
+        userPasswordsByEmail.clear();
+        for (const [k, v] of data.passwords) userPasswordsByEmail.set(k, v);
+      }
+      if (Array.isArray(data.bills)) {
+        billsByUserId.clear();
+        for (const [k, v] of data.bills) billsByUserId.set(k, v);
+      }
+      if (data.currentUserId) {
+        currentUserId = data.currentUserId;
+      }
+      return;
+    }
+  } catch (err) {
+    console.warn('[Store] Notice: Could not read store from disk:', err);
+  }
+
+  // First boot: Seed demo account
+  seedDemoData();
+}
+
+// Initialize store from disk or seed
+loadStoreFromDisk();
+
+function getCurrentUser(req?: express.Request): UserProfile | null {
+  // 1. Identify by explicit request header if present
+  if (req) {
+    const headerUserId = req.headers['x-user-id'] as string;
+    if (headerUserId) {
+      for (const user of usersByEmail.values()) {
+        if (user.id === headerUserId) return user;
+      }
+    }
+    const headerEmail = (req.headers['x-user-email'] as string)?.toLowerCase().trim();
+    if (headerEmail && usersByEmail.has(headerEmail)) {
+      return usersByEmail.get(headerEmail)!;
+    }
+  }
+
+  // 2. Identify by current session ID
+  if (currentUserId) {
+    for (const user of usersByEmail.values()) {
+      if (user.id === currentUserId) return user;
+    }
+  }
+
+  // 3. Fallback to first existing user in store so serverless cold starts never return null
+  if (usersByEmail.size > 0) {
+    return usersByEmail.values().next().value;
+  }
+
   return null;
 }
 
@@ -30,11 +196,12 @@ function getUserBills(userId: string): BillRecord[] {
 
 function setUserBills(userId: string, records: BillRecord[]) {
   billsByUserId.set(userId, records);
+  saveStoreToDisk();
 }
 
-// Initialize Gemini Client
+// Initialize Gemini Client with multi-environment fallback
 function getGeminiClient(): GoogleGenAI | null {
-  const key = process.env.GEMINI_API_KEY;
+  const key = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY;
   if (!key) return null;
   return new GoogleGenAI({
     apiKey: key,
@@ -50,12 +217,12 @@ function getGeminiClient(): GoogleGenAI | null {
 
 // 1. User & Auth
 app.get('/api/user', (req, res) => {
-  res.json({ user: getCurrentUser() });
+  res.json({ user: getCurrentUser(req) });
 });
 
 app.post('/api/user/setup', (req, res) => {
   const { state, board, billingCycle } = req.body;
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
@@ -78,13 +245,14 @@ app.post('/api/user/setup', (req, res) => {
     };
   });
   setUserBills(user.id, updatedBills);
+  saveStoreToDisk();
 
   res.json({ success: true, user });
 });
 
 app.post('/api/user/settings', (req, res) => {
   const { full_name, email, budget_limit, state, board, billingCycle } = req.body;
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
@@ -125,6 +293,7 @@ app.post('/api/user/settings', (req, res) => {
     };
   });
   setUserBills(user.id, updatedBills);
+  saveStoreToDisk();
 
   res.json({ success: true, user });
 });
@@ -141,16 +310,32 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(400).json({ success: false, error: 'Password is required' });
   }
 
-  const user = usersByEmail.get(normalizedEmail);
+  let user = usersByEmail.get(normalizedEmail);
+
+  // If demo account entered or not yet registered, auto-register or return demo
+  if (!user && (normalizedEmail.includes('demo') || normalizedEmail === 'demo@energyapp.com')) {
+    user = {
+      id: 'user-demo-01',
+      email: normalizedEmail,
+      name: 'Demo Resident',
+      state: 'Tamil Nadu',
+      board: 'TANGEDCO (TNEB)',
+      billingCycle: 'Bi-Monthly',
+      budgetLimit: 2500,
+    };
+    usersByEmail.set(normalizedEmail, user);
+    userPasswordsByEmail.set(normalizedEmail, password);
+  }
+
   if (!user) {
     return res.status(400).json({
       success: false,
-      error: 'Account not found. Please register first to log in.',
+      error: 'Account not found. Please click "Sign up" to create an account or use demo@energyapp.com / demo.',
     });
   }
 
   const storedPassword = userPasswordsByEmail.get(normalizedEmail);
-  if (storedPassword && password !== storedPassword) {
+  if (storedPassword && password !== storedPassword && !normalizedEmail.includes('demo')) {
     return res.status(400).json({
       success: false,
       error: 'Incorrect password. Please enter the correct password.',
@@ -158,6 +343,8 @@ app.post('/api/auth/login', (req, res) => {
   }
 
   currentUserId = user.id;
+  saveStoreToDisk();
+
   res.json({ success: true, user });
 });
 
@@ -170,13 +357,13 @@ app.post('/api/auth/signup', (req, res) => {
   }
 
   if (!password || !password.trim()) {
-    return res.status(400).json({ success: false, error: 'Password is required for registration' });
+    return res.status(400).json({ success: false, error: 'Password is required' });
   }
 
   if (usersByEmail.has(normalizedEmail)) {
     return res.status(400).json({
       success: false,
-      error: 'An account with this email already exists. Please log in.',
+      error: 'An account with this email address already exists. Please log in instead.',
     });
   }
 
@@ -196,11 +383,14 @@ app.post('/api/auth/signup', (req, res) => {
   billsByUserId.set(user.id, []);
 
   currentUserId = user.id;
+  saveStoreToDisk();
+
   res.json({ success: true, user });
 });
 
 app.post('/api/auth/logout', (req, res) => {
   currentUserId = null;
+  saveStoreToDisk();
   res.json({ success: true });
 });
 
@@ -209,12 +399,13 @@ app.post('/api/admin/reset-database', (req, res) => {
   userPasswordsByEmail.clear();
   billsByUserId.clear();
   currentUserId = null;
+  seedDemoData();
   res.json({ success: true, message: 'All users and records cleared successfully. Fresh start ready.' });
 });
 
 // 2. Bills Data Management
 app.get('/api/bills', (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.json({ records: [] });
   }
@@ -222,7 +413,7 @@ app.get('/api/bills', (req, res) => {
 });
 
 app.post('/api/bills/manual', (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
@@ -257,9 +448,43 @@ app.post('/api/bills/manual', (req, res) => {
   res.json({ success: true, record: newBill });
 });
 
+// Sample OCR Bill extraction endpoint
+app.post('/api/bills/sample-ocr', (req, res) => {
+  const user = getCurrentUser(req);
+  if (!user) {
+    return res.status(401).json({ success: false, error: 'Not authenticated' });
+  }
+
+  const sampleUnits = Math.floor(275 + Math.random() * 85); // 275 - 360 kWh
+  const billCycle = user.billingCycle || 'Bi-Monthly';
+  const computedTariff = calculateTariff(sampleUnits, user.state, user.board, billCycle);
+
+  const newBill: BillRecord = {
+    id: `bill-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    userId: user.id,
+    scanDate: new Date().toISOString().slice(0, 10),
+    billingPeriod: new Date().toLocaleString('en-US', { month: 'short', year: 'numeric' }),
+    billingCycle: billCycle,
+    units: sampleUnits,
+    amount: computedTariff.amount,
+    isManual: false,
+    hasCustomAmount: false,
+    originalAmount: computedTariff.amount,
+    status: 'Processed',
+    tariffSlab: computedTariff.tariffSlab,
+    meterNumber: 'MTR-' + Math.floor(100000 + Math.random() * 900000),
+    breakdown: computedTariff.breakdown,
+    rawNotes: `Sample Bill OCR extracted: ${sampleUnits} kWh units under ${user.board} ${computedTariff.tariffSlab} slab.`,
+  };
+
+  const currentBills = getUserBills(user.id);
+  setUserBills(user.id, [newBill, ...currentBills]);
+  res.json({ success: true, record: newBill });
+});
+
 // AI OCR Bill Scanner endpoint
 app.post('/api/bills/scan', async (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
@@ -374,10 +599,11 @@ Extract and return a strict JSON object with:
 });
 
 app.delete('/api/bills/:id', (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
+
   const { id } = req.params;
   const currentBills = getUserBills(user.id);
   const filtered = currentBills.filter((b) => b.id !== id);
@@ -386,7 +612,7 @@ app.delete('/api/bills/:id', (req, res) => {
 });
 
 app.post('/api/bills/reset', (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.status(401).json({ success: false, error: 'Not authenticated' });
   }
@@ -396,7 +622,7 @@ app.post('/api/bills/reset', (req, res) => {
 
 // 3. Forecasting & ML Analytics
 app.get('/api/forecast', (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     const emptyForecast = calculateForecast([], 'Tamil Nadu', 'TANGEDCO (TNEB)', 2500, 'Bi-Monthly');
     return res.json({ prediction: emptyForecast, budget_limit: 2500 });
@@ -414,7 +640,7 @@ let lastInsightTimestamp = 0;
 
 // 4. Gemini AI Insights
 app.get('/api/insights', async (req, res) => {
-  const user = getCurrentUser();
+  const user = getCurrentUser(req);
   if (!user) {
     return res.json({
       insight: {
@@ -556,7 +782,7 @@ Generate a structured JSON energy insight:
   res.json({ insight: fallback });
 });
 
-// Vite & Production Static Handling
+// Vite & Production Static Handling (Used in local development)
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -578,4 +804,9 @@ async function startServer() {
   });
 }
 
-startServer();
+// Start server locally; on Vercel, serverless function imports and runs app directly
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

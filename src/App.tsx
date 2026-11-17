@@ -28,31 +28,78 @@ export default function App() {
   const [insight, setInsight] = useState<GeminiInsight | null>(null);
   const [isLoadingInsight, setIsLoadingInsight] = useState<boolean>(false);
 
-  // Fetch initial backend state
+  // Restore authenticated session & cached data from localStorage on initial render
+  useEffect(() => {
+    try {
+      const savedUser = localStorage.getItem('energy_app_user');
+      if (savedUser) {
+        const parsed = JSON.parse(savedUser);
+        if (parsed && parsed.email) {
+          setUser(parsed);
+          setIsAuthenticated(true);
+        }
+      }
+
+      const savedBills = localStorage.getItem('energy_app_bills');
+      if (savedBills) {
+        const parsedBills = JSON.parse(savedBills);
+        if (Array.isArray(parsedBills) && parsedBills.length > 0) {
+          setBills(parsedBills);
+        }
+      }
+    } catch (e) {
+      console.warn('Could not read cached session:', e);
+    }
+  }, []);
+
+  // Auth headers for stateless Vercel Serverless Function identification
+  const getAuthHeaders = () => ({
+    'Content-Type': 'application/json',
+    ...(user.id ? { 'x-user-id': user.id } : {}),
+    ...(user.email ? { 'x-user-email': user.email } : {}),
+  });
+
+  // Fetch initial backend state with fallback resilience
   const fetchAllData = async () => {
     try {
+      const headers = getAuthHeaders();
+
       // 1. Fetch User
-      const userRes = await fetch('/api/user');
-      const userData = await userRes.json();
-      if (userData.user) setUser(userData.user);
+      const userRes = await fetch('/api/user', { headers });
+      if (userRes.ok) {
+        const userData = await userRes.json();
+        if (userData.user) {
+          setUser(userData.user);
+          localStorage.setItem('energy_app_user', JSON.stringify(userData.user));
+        }
+      }
 
       // 2. Fetch Bills
-      const billsRes = await fetch('/api/bills');
-      const billsData = await billsRes.json();
-      if (billsData.records) setBills(billsData.records);
+      const billsRes = await fetch('/api/bills', { headers });
+      if (billsRes.ok) {
+        const billsData = await billsRes.json();
+        if (billsData.records) {
+          setBills(billsData.records);
+          localStorage.setItem('energy_app_bills', JSON.stringify(billsData.records));
+        }
+      }
 
       // 3. Fetch Forecast
-      const forecastRes = await fetch('/api/forecast');
-      const forecastData = await forecastRes.json();
-      if (forecastData.prediction) setPrediction(forecastData.prediction);
+      const forecastRes = await fetch('/api/forecast', { headers });
+      if (forecastRes.ok) {
+        const forecastData = await forecastRes.json();
+        if (forecastData.prediction) setPrediction(forecastData.prediction);
+      }
 
       // 4. Fetch Insights
       setIsLoadingInsight(true);
-      const insightRes = await fetch('/api/insights');
-      const insightData = await insightRes.json();
-      if (insightData.insight) setInsight(insightData.insight);
+      const insightRes = await fetch('/api/insights', { headers });
+      if (insightRes.ok) {
+        const insightData = await insightRes.json();
+        if (insightData.insight) setInsight(insightData.insight);
+      }
     } catch (err) {
-      console.error('Error loading data:', err);
+      console.warn('Network issue fetching live data, using cached local data:', err);
     } finally {
       setIsLoadingInsight(false);
     }
@@ -65,76 +112,141 @@ export default function App() {
   }, [isAuthenticated]);
 
   const handleBillAdded = (newBill: BillRecord) => {
-    setBills((prev) => [newBill, ...prev]);
+    setBills((prev) => {
+      const updated = [newBill, ...prev];
+      localStorage.setItem('energy_app_bills', JSON.stringify(updated));
+      return updated;
+    });
+
     // Refresh forecast & insights
-    fetch('/api/forecast')
-      .then((r) => r.json())
-      .then((d) => d.prediction && setPrediction(d.prediction));
+    fetch('/api/forecast', { headers: getAuthHeaders() })
+      .then((r) => r.ok && r.json())
+      .then((d) => d && d.prediction && setPrediction(d.prediction))
+      .catch((err) => console.warn('Forecast refresh notice:', err));
   };
 
   const handleDeleteBill = async (id: string) => {
     try {
-      await fetch(`/api/bills/${id}`, { method: 'DELETE' });
-      setBills((prev) => prev.filter((b) => b.id !== id));
+      await fetch(`/api/bills/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
+      setBills((prev) => {
+        const filtered = prev.filter((b) => b.id !== id);
+        localStorage.setItem('energy_app_bills', JSON.stringify(filtered));
+        return filtered;
+      });
+
       // Refresh forecast
-      const forecastRes = await fetch('/api/forecast');
-      const forecastData = await forecastRes.json();
-      if (forecastData.prediction) setPrediction(forecastData.prediction);
+      const forecastRes = await fetch('/api/forecast', { headers: getAuthHeaders() });
+      if (forecastRes.ok) {
+        const forecastData = await forecastRes.json();
+        if (forecastData.prediction) setPrediction(forecastData.prediction);
+      }
     } catch (err) {
-      console.error('Error deleting bill:', err);
+      console.warn('Error deleting bill, updating locally:', err);
+      setBills((prev) => {
+        const filtered = prev.filter((b) => b.id !== id);
+        localStorage.setItem('energy_app_bills', JSON.stringify(filtered));
+        return filtered;
+      });
     }
   };
 
   const handleResetHistory = async () => {
     try {
-      const res = await fetch('/api/bills/reset', { method: 'POST' });
-      const data = await res.json();
-      if (data.records) setBills(data.records);
+      const res = await fetch('/api/bills/reset', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.records) setBills(data.records);
+      } else {
+        setBills([]);
+      }
+      localStorage.setItem('energy_app_bills', JSON.stringify([]));
       fetchAllData();
     } catch (err) {
-      console.error('Reset failed:', err);
+      console.warn('Reset history fallback:', err);
+      setBills([]);
+      localStorage.setItem('energy_app_bills', JSON.stringify([]));
     }
   };
 
   const handleUpdateSetup = async (state: string, board: string, billingCycle?: 'Monthly' | 'Bi-Monthly') => {
-    const res = await fetch('/api/user/setup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ state, board, billingCycle }),
-    });
-    const data = await res.json();
-    if (data.user) {
-      setUser(data.user);
-      fetchAllData();
+    try {
+      const res = await fetch('/api/user/setup', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ state, board, billingCycle }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user) {
+          setUser(data.user);
+          localStorage.setItem('energy_app_user', JSON.stringify(data.user));
+          fetchAllData();
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn('Setup update notice:', err);
     }
+
+    // Local fallback update
+    setUser((prev) => {
+      const updated = { ...prev, state, board, billingCycle: billingCycle || prev.billingCycle };
+      localStorage.setItem('energy_app_user', JSON.stringify(updated));
+      return updated;
+    });
   };
 
   const handleUpdateSettings = async (updated: Partial<UserProfile>) => {
-    const res = await fetch('/api/user/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        full_name: updated.name,
-        email: updated.email,
-        budget_limit: updated.budgetLimit,
-        state: updated.state,
-        board: updated.board,
-        billingCycle: updated.billingCycle,
-      }),
-    });
-    const data = await res.json();
-    if (data.user) {
-      setUser(data.user);
-      fetchAllData();
+    try {
+      const res = await fetch('/api/user/settings', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          full_name: updated.name,
+          email: updated.email,
+          budget_limit: updated.budgetLimit,
+          state: updated.state,
+          board: updated.board,
+          billingCycle: updated.billingCycle,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.user) {
+          setUser(data.user);
+          localStorage.setItem('energy_app_user', JSON.stringify(data.user));
+          fetchAllData();
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn('Settings update notice:', err);
     }
+
+    // Local fallback update
+    setUser((prev) => {
+      const merged = { ...prev, ...updated };
+      localStorage.setItem('energy_app_user', JSON.stringify(merged));
+      return merged;
+    });
   };
 
   const handleLogout = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
     } catch (e) {
-      console.error(e);
+      console.warn('Logout notice:', e);
     }
+    localStorage.removeItem('energy_app_user');
     setIsAuthenticated(false);
     setBills([]);
     setPrediction(null);
@@ -257,4 +369,3 @@ export default function App() {
     </div>
   );
 }
-
