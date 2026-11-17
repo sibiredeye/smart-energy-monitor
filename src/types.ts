@@ -62,3 +62,14 @@ export interface StateBoardOption {
   state: string;
   boards: string[];
 }
+
+export interface SmartMeterTelemetry {
+  voltage: number;
+  current: number;
+  powerFactor: number;
+  activePower: number;
+  incrementalKWh: number;
+  accumulatedKWh: number;
+  isCompressorSpike: boolean;
+  timestamp: string;
+}
